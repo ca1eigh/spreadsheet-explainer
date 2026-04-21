@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import * as d3 from "d3";
 import * as XLSX from "xlsx";
+import { jsPDF } from "jspdf";
 
 // ── Sample dataset with seeded errors ──────────────────────────────────────
 const SAMPLE_DATA = [
@@ -55,6 +56,10 @@ function parseNumeric(value) {
     if (cleaned === "") return null;
     const n = Number(cleaned);
     return Number.isFinite(n) ? n : null;
+}
+
+function cloneRows(rows) {
+    return rows.map((row) => ({ ...row }));
 }
 
 function inferColumnsAndData(rows) {
@@ -137,6 +142,112 @@ function downloadEditedFile(data, columns, bookType = "xlsx") {
     const ext = bookType === "csv" ? "csv" : "xlsx";
     const filename = `sheetscan-edited-${stamp}.${ext}`;
     XLSX.writeFile(wb, filename, bookType === "csv" ? { bookType: "csv" } : {});
+}
+
+function formatCellValue(value) {
+    if (value === null || value === undefined || value === "") return "Empty";
+    if (typeof value === "number") return Number.isFinite(value) ? value.toLocaleString() : String(value);
+    return String(value);
+}
+
+function suggestionForAnomaly(anomaly) {
+    if (anomaly.severity === "missing") return "Fill in a valid value or explicitly mark this field as intentionally blank.";
+    if (anomaly.severity === "invalid") return "Correct to a logically valid value (for example, remove negative quantities where not allowed).";
+    if (anomaly.severity === "critical") return "Validate against source records and business rules, then correct or document the exception.";
+    if (anomaly.severity === "warning") return "Review against expected range for this field and confirm if the value is legitimate.";
+    return "Review and confirm this cell with the data owner.";
+}
+
+function getRelatedAnomalies(anomaly, anomalies) {
+    const sameColumn = anomalies.filter((a) => a.col === anomaly.col && a.row !== anomaly.row);
+    const sameRow = anomalies.filter((a) => a.row === anomaly.row && a.col !== anomaly.col);
+    return { sameColumn, sameRow };
+}
+
+function buildAuditReport({ anomalies, data, columns, counts }) {
+    const now = new Date();
+    const header = [
+        "SheetScan Audit Report",
+        `Generated: ${now.toLocaleString()}`,
+        `Rows analyzed: ${data.length}`,
+        `Columns analyzed: ${columns.length}`,
+        `Total issues: ${anomalies.length}`,
+        `Severity breakdown: critical ${counts.critical}, warning ${counts.warning}, missing ${counts.missing}, invalid ${counts.invalid}`,
+        "",
+    ];
+
+    const body = anomalies.length
+        ? anomalies.map((anomaly, idx) => {
+            const { sameColumn, sameRow } = getRelatedAnomalies(anomaly, anomalies);
+            const traceColumn = sameColumn.slice(0, 3).map((a) => `Row ${a.row + 1}`).join(", ") || "None";
+            const traceRow = sameRow.slice(0, 3).map((a) => a.col).join(", ") || "None";
+            return [
+                `Issue ${idx + 1}`,
+                `Severity: ${anomaly.severity.toUpperCase()}`,
+                `Location: Row ${anomaly.row + 1}, Column "${anomaly.col}"`,
+                `Observed value: ${formatCellValue(anomaly.value)}`,
+                `Detected problem: ${anomaly.reason}`,
+                `Traceback context: ${sameColumn.length} related issue(s) in same column (${traceColumn}); ${sameRow.length} related issue(s) in same row (${traceRow}).`,
+                `Suggested action: ${suggestionForAnomaly(anomaly)}`,
+                "",
+            ].join("\n");
+        }).join("\n")
+        : "No anomalies were detected in this dataset.";
+
+    return `${header.join("\n")}${body}`;
+}
+
+function buildAuditDocHtml(reportText) {
+    const escaped = reportText
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;");
+    return `<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8" />
+<title>SheetScan Audit Report</title>
+</head>
+<body style="font-family: Arial, sans-serif; font-size: 12px; line-height: 1.4; color: #111;">
+<h1 style="margin: 0 0 8px;">SheetScan Audit Report</h1>
+<p style="margin: 0 0 14px; color: #444;">Shareable stakeholder summary of detected sheet anomalies.</p>
+<pre style="white-space: pre-wrap; word-break: break-word; border: 1px solid #ddd; padding: 12px; border-radius: 6px;">${escaped}</pre>
+</body>
+</html>`;
+}
+
+function downloadAuditReport({ format, reportText }) {
+    const stamp = new Date().toISOString().slice(0, 10);
+    if (format === "pdf") {
+        const pdf = new jsPDF({ unit: "pt", format: "a4" });
+        const margin = 40;
+        const pageHeight = pdf.internal.pageSize.getHeight();
+        const maxY = pageHeight - margin;
+        let y = margin;
+        const lines = pdf.splitTextToSize(reportText, 515);
+        pdf.setFont("courier", "normal");
+        pdf.setFontSize(10);
+        lines.forEach((line) => {
+            if (y > maxY) {
+                pdf.addPage();
+                y = margin;
+            }
+            pdf.text(line, margin, y);
+            y += 14;
+        });
+        pdf.save(`sheetscan-audit-report-${stamp}.pdf`);
+        return;
+    }
+
+    const blob = new Blob([buildAuditDocHtml(reportText)], { type: "application/msword;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = `sheetscan-audit-report-${stamp}.doc`;
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+    URL.revokeObjectURL(url);
 }
 
 // ── Anomaly detection engine ────────────────────────────────────────────────
@@ -320,8 +431,20 @@ export default function SpreadsheetExplainer() {
     const [filter, setFilter] = useState("all");
     const [animatedRows, setAnimatedRows] = useState(new Set());
     const [uploadMessage, setUploadMessage] = useState("");
+    const [historyOpen, setHistoryOpen] = useState(false);
+    const [versionHistory, setVersionHistory] = useState(() => [
+        {
+            id: "sample-initial",
+            label: "Initial sample dataset",
+            timestamp: new Date().toISOString(),
+            data: cloneRows(SAMPLE_DATA),
+            columns: DEFAULT_COLUMNS.map((col) => ({ ...col })),
+            change: null,
+        },
+    ]);
     const fileInputRef = useRef(null);
     const exportFormatRef = useRef(null);
+    const reportFormatRef = useRef(null);
 
     useEffect(() => {
         setAnomalies(detectAnomalies(data, columns));
@@ -342,11 +465,44 @@ export default function SpreadsheetExplainer() {
         setEditValue(val === null || val === undefined ? "" : String(val));
     };
 
+    const pushHistoryEntry = useCallback((entry) => {
+        setVersionHistory((prev) => [entry, ...prev].slice(0, 30));
+    }, []);
+
+    const restoreVersion = (entry) => {
+        const restoredData = cloneRows(entry.data);
+        const restoredColumns = entry.columns.map((col) => ({ ...col }));
+        const source = toSourcePreview(restoredData, restoredColumns);
+        setColumns(restoredColumns);
+        setData(restoredData);
+        setSourceHeaders(source.headers);
+        setSourceRows(source.sourceRows);
+        setSelected(null);
+        setFilter("all");
+        setEditingCell(null);
+        setUploadMessage(`Restored version from ${new Date(entry.timestamp).toLocaleString()}.`);
+        setHistoryOpen(false);
+    };
+
     const commitEdit = (rowIdx, colKey) => {
         const col = columns.find(c => c.key === colKey);
+        const previousValue = data[rowIdx]?.[colKey] ?? null;
         const parsed = col.type === "number" ? (editValue === "" ? null : parseFloat(editValue)) : editValue;
         const newData = data.map((row, i) => i === rowIdx ? { ...row, [colKey]: parsed } : row);
         setData(newData);
+        pushHistoryEntry({
+            id: `edit-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`,
+            label: `Edited row ${rowIdx + 1}, ${col.label}`,
+            timestamp: new Date().toISOString(),
+            data: cloneRows(newData),
+            columns: columns.map((c) => ({ ...c })),
+            change: {
+                row: rowIdx + 1,
+                column: col.label,
+                before: previousValue,
+                after: parsed,
+            },
+        });
         setEditingCell(null);
         setAnimatedRows(prev => new Set([...prev, rowIdx]));
         setTimeout(() => setAnimatedRows(prev => { const s = new Set(prev); s.delete(rowIdx); return s; }), 600);
@@ -391,6 +547,16 @@ export default function SpreadsheetExplainer() {
             setFilter("all");
             setEditingCell(null);
             setUploadMessage(`Loaded ${file.name} (${normalized.data.length} rows${rows.length > MAX_ROWS ? `, capped at ${MAX_ROWS}` : ""}).`);
+            setVersionHistory([
+                {
+                    id: `upload-${Date.now()}`,
+                    label: `Uploaded ${file.name}`,
+                    timestamp: new Date().toISOString(),
+                    data: cloneRows(normalized.data),
+                    columns: normalized.columns.map((col) => ({ ...col })),
+                    change: null,
+                },
+            ]);
         } catch {
             setUploadMessage("Could not parse file. Upload a valid CSV or Excel file.");
         } finally {
@@ -408,9 +574,24 @@ export default function SpreadsheetExplainer() {
         setFilter("all");
         setEditingCell(null);
         setUploadMessage("Loaded sample dataset.");
+        setVersionHistory([
+            {
+                id: `sample-${Date.now()}`,
+                label: "Loaded sample dataset",
+                timestamp: new Date().toISOString(),
+                data: cloneRows(SAMPLE_DATA),
+                columns: DEFAULT_COLUMNS.map((col) => ({ ...col })),
+                change: null,
+            },
+        ]);
     };
 
     const counts = { critical: anomalies.filter(a => a.severity === "critical").length, warning: anomalies.filter(a => a.severity === "warning").length, missing: anomalies.filter(a => a.severity === "missing").length, invalid: anomalies.filter(a => a.severity === "invalid").length };
+    const handleDownloadReport = () => {
+        const format = reportFormatRef.current?.value === "doc" ? "doc" : "pdf";
+        const reportText = buildAuditReport({ anomalies, data, columns, counts });
+        downloadAuditReport({ format, reportText });
+    };
 
     return (
         <div style={{ background: "#0d1117", minHeight: "100vh", fontFamily: "'JetBrains Mono', monospace", color: "#c9d1d9", display: "flex", flexDirection: "column" }}>
@@ -459,6 +640,31 @@ export default function SpreadsheetExplainer() {
                     style={{ background: "#1f6feb", border: "1px solid #388bfd", color: "#f0f6fc", borderRadius: "6px", padding: "6px 10px", fontSize: "11px", cursor: "pointer" }}
                 >
                     Download newly edited file
+                </button>
+                <button
+                    type="button"
+                    title="View and restore previous sheet versions"
+                    onClick={() => setHistoryOpen(true)}
+                    style={{ background: "#21262d", border: "1px solid #30363d", color: "#c9d1d9", borderRadius: "6px", padding: "6px 10px", fontSize: "11px", cursor: "pointer" }}
+                >
+                    Version History ({versionHistory.length})
+                </button>
+                <select
+                    ref={reportFormatRef}
+                    defaultValue="pdf"
+                    aria-label="Audit report export format"
+                    style={{ background: "#21262d", border: "1px solid #30363d", color: "#c9d1d9", borderRadius: "6px", padding: "5px 8px", fontSize: "11px", cursor: "pointer", fontFamily: "inherit" }}
+                >
+                    <option value="pdf">Report PDF</option>
+                    <option value="doc">Report DOC</option>
+                </select>
+                <button
+                    type="button"
+                    title="Export a shareable audit report with issue tracebacks and suggested fixes"
+                    onClick={handleDownloadReport}
+                    style={{ background: "#8957e5", border: "1px solid #a371f7", color: "#f0f6fc", borderRadius: "6px", padding: "6px 10px", fontSize: "11px", cursor: "pointer" }}
+                >
+                    Download audit report
                 </button>
                 <div style={{ marginLeft: "auto", display: "flex", gap: "8px" }}>
                     {[["critical", "#e53e3e"], ["warning", "#d69e2e"], ["missing", "#718096"], ["invalid", "#fc8181"]].map(([sev, col]) => (
@@ -624,6 +830,58 @@ export default function SpreadsheetExplainer() {
                     </div>
                 </div>
             </div>
+
+            {historyOpen && (
+                <div
+                    onClick={() => setHistoryOpen(false)}
+                    style={{ position: "fixed", inset: 0, background: "rgba(1,4,9,0.72)", display: "flex", justifyContent: "center", alignItems: "center", zIndex: 20 }}
+                >
+                    <div
+                        onClick={(e) => e.stopPropagation()}
+                        style={{ width: "min(720px, 92vw)", maxHeight: "80vh", overflow: "hidden", background: "#161b22", border: "1px solid #30363d", borderRadius: "10px", display: "flex", flexDirection: "column" }}
+                    >
+                        <div style={{ padding: "12px 14px", borderBottom: "1px solid #21262d", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+                            <div>
+                                <div style={{ fontSize: "12px", color: "#f0f6fc", fontWeight: 700 }}>Version History</div>
+                                <div style={{ marginTop: "3px", fontSize: "11px", color: "#8b949e" }}>Snapshots are captured after each cell edit.</div>
+                            </div>
+                            <button
+                                type="button"
+                                onClick={() => setHistoryOpen(false)}
+                                style={{ background: "#21262d", border: "1px solid #30363d", color: "#c9d1d9", borderRadius: "6px", padding: "4px 8px", fontSize: "11px", cursor: "pointer" }}
+                            >
+                                Close
+                            </button>
+                        </div>
+                        <div style={{ overflow: "auto", padding: "10px 12px 12px" }}>
+                            {versionHistory.map((entry, idx) => (
+                                <div
+                                    key={entry.id}
+                                    style={{ background: "#0d1117", border: "1px solid #21262d", borderRadius: "8px", padding: "10px 12px", marginBottom: "8px", display: "flex", alignItems: "center", gap: "10px" }}
+                                >
+                                    <div style={{ minWidth: "76px", color: "#4a5568", fontSize: "10px", textTransform: "uppercase", letterSpacing: "0.4px" }}>
+                                        v{versionHistory.length - idx}
+                                    </div>
+                                    <div style={{ flex: 1, minWidth: 0 }}>
+                                        <div style={{ color: "#c9d1d9", fontSize: "12px", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{entry.label}</div>
+                                        <div style={{ marginTop: "2px", color: "#8b949e", fontSize: "11px" }}>
+                                            {new Date(entry.timestamp).toLocaleString()}
+                                            {entry.change && ` • Row ${entry.change.row} • ${entry.change.column} • ${entry.change.before ?? "—"} -> ${entry.change.after ?? "—"}`}
+                                        </div>
+                                    </div>
+                                    <button
+                                        type="button"
+                                        onClick={() => restoreVersion(entry)}
+                                        style={{ background: "#1f6feb", border: "1px solid #388bfd", color: "#f0f6fc", borderRadius: "6px", padding: "5px 9px", fontSize: "11px", cursor: "pointer", flexShrink: 0 }}
+                                    >
+                                        Restore
+                                    </button>
+                                </div>
+                            ))}
+                        </div>
+                    </div>
+                </div>
+            )}
 
             <style>{`
         @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&display=swap');
